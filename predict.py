@@ -5,7 +5,6 @@
 import cv2
 import numpy as np
 import tensorflow as tf
-import mediapipe as mp
 import joblib
 import os
 from collections import deque
