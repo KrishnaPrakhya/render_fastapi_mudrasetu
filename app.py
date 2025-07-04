@@ -23,11 +23,19 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- Path Setup ---
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_DIR_REL = os.path.join(BASE_DIR, 'model')
-sys.path.append(MODEL_DIR_REL)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))  # /opt/render/project/src locally on Render
+# Your pretrained model folder lives **in the same repository directory** as this app.py file, so we
+# simply make all paths relative to SCRIPT_DIR. This avoids the "No file or directory" error that
+# occurred on Render when the code looked for /opt/render/project/model/...
+# If you later decide to move the weights elsewhere you can still override these paths with env vars.
+MODEL_DIR = os.path.join(SCRIPT_DIR, 'sign_model_focused_enhanced_attention_v2_0.9880_prior1')
 
-# Import prediction functions
+# Add SCRIPT_DIR to sys.path so that local imports (like predict.py) work when uvicorn/gunicorn sets a
+# different working directory.
+if SCRIPT_DIR not in sys.path:
+    sys.path.append(SCRIPT_DIR)
+
+# Import prediction functions (after we tweaked sys.path)
 from predict import load_model_with_custom_objects, add_temporal_features_realtime
 from predict_video import predict_on_video
 
@@ -44,7 +52,6 @@ app.add_middleware(
 )
 
 # --- Configuration ---
-MODEL_DIR = os.path.join(MODEL_DIR_REL, 'sign_model_focused_enhanced_attention_v2_0.9880_prior1')
 MODEL_PATH = os.path.join(MODEL_DIR, 'corrected_enhanced_focused_attention_classifier_best.keras')
 SCALER_PATH = os.path.join(MODEL_DIR, 'scaler.pkl')
 LABEL_ENCODER_PATH = os.path.join(MODEL_DIR, 'label_encoder.pkl')
