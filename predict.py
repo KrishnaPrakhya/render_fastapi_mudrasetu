@@ -17,13 +17,55 @@ import traceback
 
 try:
     import keras
-    from keras.utils import register_keras_serializable  # Keras 3 API
-    USING_KERAS3 = True
-except ImportError:  # Stand-alone Keras not present – use tf.keras as before
+    # Ensure we actually got Keras 3+.  Older keras==2.x that ships as a thin
+    # wrapper around tf.keras *won't* have the required module layout and will
+    # still explode during deserialization.  So if we detect a 2.x version we
+    # deliberately fall through to the tf.keras fallback instead.
+    from packaging.version import Version, InvalidVersion
+
+    try:
+        _KERAS_VERSION = Version(keras.__version__)
+    except InvalidVersion:
+        _KERAS_VERSION = None
+
+    if _KERAS_VERSION and _KERAS_VERSION.major >= 3:
+        from keras.utils import register_keras_serializable  # Keras 3 API
+        USING_KERAS3 = True
+    else:
+        raise ImportError("Keras version is <3; falling back to tf.keras")
+
+except ImportError:  # Stand-alone Keras 3 not present – use tf.keras as fallback
     import tensorflow as tf
     keras = tf.keras  # alias so the rest of the code can refer to `keras`
     from tensorflow.keras.utils import register_keras_serializable  # noqa
     USING_KERAS3 = False
+
+# ---------------------------------------------------------------------
+# Compatibility shim: create module aliases so that importlib can resolve
+# symbols like `keras.src.models.functional.Functional` that were written
+# by Keras-3 when serializing the model.  We map them to tf.keras modules
+# so deserialization succeeds without installing keras-3 (which conflicts
+# with TensorFlow 2.15).
+# ---------------------------------------------------------------------
+import types, sys as _sys
+
+# Base alias – pretend the `keras` top-level package exists and points to
+# tf.keras.  Many objects look under `keras.layers`, `keras.models`, …
+_sys.modules.setdefault('keras', keras)
+
+# keras.src – simple empty module that also points to tf.keras to keep the
+# dotted path alive.
+keras_src = types.ModuleType('keras.src')
+_sys.modules['keras.src'] = keras_src
+
+# Map sub-packages we know the .keras file references.
+_sys.modules['keras.src.models'] = tf.keras.models
+_sys.modules['keras.src.models.functional'] = tf.keras.models
+_sys.modules['keras.src.layers'] = tf.keras.layers
+_sys.modules['keras.src.layers.core'] = tf.keras.layers
+_sys.modules['keras.src.engine'] = tf.keras
+# Add any other sub-packages lazily when import fails – but the above is
+# enough for typical Functional/Sequential models.
 
 # --- Configuration ---
 MODEL_DIR = 'sign_model_focused_enhanced_attention_v2_0.9880_prior1' # *** Path to the ENHANCED FOCUSED model ***
