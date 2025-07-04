@@ -10,6 +10,21 @@ import os
 from collections import deque
 import traceback
 
+# Try to import standalone Keras 3 first (works with TensorFlow >= 2.15 as backend).
+# Fallback to tf.keras when Keras 3 is not installed. This makes the inference code
+# compatible with both local environments (that may only have TensorFlow) and
+# Render where the model was saved with Keras 3.
+
+try:
+    import keras
+    from keras.utils import register_keras_serializable  # Keras 3 API
+    USING_KERAS3 = True
+except ImportError:  # Stand-alone Keras not present – use tf.keras as before
+    import tensorflow as tf
+    keras = tf.keras  # alias so the rest of the code can refer to `keras`
+    from tensorflow.keras.utils import register_keras_serializable  # noqa
+    USING_KERAS3 = False
+
 # --- Configuration ---
 MODEL_DIR = 'sign_model_focused_enhanced_attention_v2_0.9880_prior1' # *** Path to the ENHANCED FOCUSED model ***
 MODEL_PATH = os.path.join(MODEL_DIR, 'corrected_enhanced_focused_attention_classifier_best.keras')
@@ -30,8 +45,8 @@ DISPLAY_WIDTH = 1280
 DISPLAY_HEIGHT = 720
 
 # --- Custom Attention Layer Definition (Must match training script) ---
-@tf.keras.utils.register_keras_serializable(package='CustomLayers')
-class AttentionWeightedAverage(tf.keras.layers.Layer):
+@register_keras_serializable(package='CustomLayers')
+class AttentionWeightedAverage(keras.layers.Layer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
@@ -51,23 +66,45 @@ class AttentionWeightedAverage(tf.keras.layers.Layer):
 # --- Helper Functions ---
 
 def load_model_with_custom_objects(model_path):
-    """Loads a Keras model with custom objects and recompiles."""
+    """Load the SavedModel/`.keras` file with the available Keras implementation.
+
+    The model was trained & exported with stand-alone Keras 3. If that package
+    is available we prefer to use it. Otherwise we fall back to `tf.keras`,
+    provided that the necessary modules from the saved configuration can be
+    imported. This approach prevents the deserialization error seen on Render
+    ("Could not deserialize class 'Functional' … keras.src.models.functional").
+    """
+
     custom_objects = {
         'AttentionWeightedAverage': AttentionWeightedAverage
     }
+
     try:
-        print(f"Attempting to load model from: {model_path}")
-        model = tf.keras.models.load_model(
-            model_path, 
-            custom_objects=custom_objects, 
-            compile=False 
-        )
+        print(f"Attempting to load model from: {model_path} (backend: {'keras' if USING_KERAS3 else 'tf.keras'})")
+
+        if USING_KERAS3:
+            model = keras.models.load_model(
+                model_path,
+                custom_objects=custom_objects,
+                compile=False,
+            )
+        else:
+            model = keras.models.load_model(
+                model_path,
+                custom_objects=custom_objects,
+                compile=False,
+            )
+
         print("Model loaded successfully.")
-        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005), # Match training LR
-                      loss='categorical_crossentropy',
-                      metrics=['accuracy'])
+
+        # Re-compile only if we are using tf.keras (stand-alone Keras 3 runners
+        # typically compile the model just-in-time for inference, but this is a
+        # cheap no-op anyway).
+        optimizer = keras.optimizers.Adam(learning_rate=0.0005)
+        model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
         print("Model recompiled.")
         return model
+
     except Exception as e:
         print(f"Error loading model: {e}")
         traceback.print_exc()
