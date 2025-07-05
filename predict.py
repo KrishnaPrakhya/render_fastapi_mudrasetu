@@ -1,344 +1,341 @@
-# %% [markdown]
-# ## 3) Inference (Enhanced Focused Data with Attention, UI, and Confidence)
-
-# %%
-import cv2
-import numpy as np
-import tensorflow as tf
-import joblib
+import asyncio
+import json
+import logging
 import os
+import sys
+import uuid
 from collections import deque
-import traceback
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List
 
-# Try to import standalone Keras 3 first (works with TensorFlow >= 2.15 as backend).
-# Fallback to tf.keras when Keras 3 is not installed. This makes the inference code
-# compatible with both local environments (that may only have TensorFlow) and
-# Render where the model was saved with Keras 3.
+import joblib
+import numpy as np
+import shutil
+from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-try:
-    import keras
-    # Ensure we actually got Keras 3+.  Older keras==2.x that ships as a thin
-    # wrapper around tf.keras *won't* have the required module layout and will
-    # still explode during deserialization.  So if we detect a 2.x version we
-    # deliberately fall through to the tf.keras fallback instead.
-    from packaging.version import Version, InvalidVersion
+# Import video call functionality
+from video_call import call_manager
 
-    try:
-        _KERAS_VERSION = Version(keras.__version__)
-    except InvalidVersion:
-        _KERAS_VERSION = None
+# --- Basic Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-    if _KERAS_VERSION and _KERAS_VERSION.major >= 3:
-        from keras.utils import register_keras_serializable  # Keras 3 API
-        USING_KERAS3 = True
-    else:
-        raise ImportError("Keras version is <3; falling back to tf.keras")
+# --- Path Setup ---
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))  # /opt/render/project/src locally on Render
+# Your pretrained model folder lives **in the same repository directory** as this app.py file, so we
+# simply make all paths relative to SCRIPT_DIR. This avoids the "No file or directory" error that
+# occurred on Render when the code looked for /opt/render/project/model/...
+# If you later decide to move the weights elsewhere you can still override these paths with env vars.
+MODEL_DIR = os.path.join(SCRIPT_DIR, 'sign_model_focused_enhanced_attention_v2_0.9880_prior1')
 
-except ImportError:  # Stand-alone Keras 3 not present – use tf.keras as fallback
-    import tensorflow as tf
-    keras = tf.keras  # alias so the rest of the code can refer to `keras`
-    from tensorflow.keras.utils import register_keras_serializable  # noqa
-    USING_KERAS3 = False
+# Add SCRIPT_DIR to sys.path so that local imports (like predict.py) work when uvicorn/gunicorn sets a
+# different working directory.
+if SCRIPT_DIR not in sys.path:
+    sys.path.append(SCRIPT_DIR)
 
-# ---------------------------------------------------------------------
-# Compatibility shim: create module aliases so that importlib can resolve
-# symbols like `keras.src.models.functional.Functional` that were written
-# by Keras-3 when serializing the model.  We map them to tf.keras modules
-# so deserialization succeeds without installing keras-3 (which conflicts
-# with TensorFlow 2.15).
-# ---------------------------------------------------------------------
-import types, sys as _sys
+# Import prediction functions (after we tweaked sys.path)
+from predict import load_model_with_custom_objects, add_temporal_features_realtime
+from predict_video import predict_on_video
 
-# Base alias – pretend the `keras` top-level package exists and points to
-# tf.keras.  Many objects look under `keras.layers`, `keras.models`, …
-_sys.modules.setdefault('keras', keras)
+# --- FastAPI App Initialization ---
+app = FastAPI(title="Ultra-Fast Sign Language Prediction API")
 
-# keras.src – simple empty module that also points to tf.keras to keep the
-# dotted path alive.
-keras_src = types.ModuleType('keras.src')
-_sys.modules['keras.src'] = keras_src
-
-# Map sub-packages we know the .keras file references.
-_sys.modules['keras.src.models'] = tf.keras.models
-_sys.modules['keras.src.models.functional'] = tf.keras.models
-_sys.modules['keras.src.layers'] = tf.keras.layers
-_sys.modules['keras.src.layers.core'] = tf.keras.layers
-_sys.modules['keras.src.engine'] = tf.keras
-# Add any other sub-packages lazily when import fails – but the above is
-# enough for typical Functional/Sequential models.
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # --- Configuration ---
-MODEL_DIR = 'sign_model_focused_enhanced_attention_v2_0.9880_prior1' # *** Path to the ENHANCED FOCUSED model ***
 MODEL_PATH = os.path.join(MODEL_DIR, 'corrected_enhanced_focused_attention_classifier_best.keras')
 SCALER_PATH = os.path.join(MODEL_DIR, 'scaler.pkl')
 LABEL_ENCODER_PATH = os.path.join(MODEL_DIR, 'label_encoder.pkl')
-
-# Model/Data specific config (must match training)
 SEQUENCE_LENGTH = 32
-NUM_SELECTED_POSE_LANDMARKS = 7 # From focused data collection
-# Indices for upper body pose landmarks from MediaPipe Pose (0: Nose, 11-16: Shoulders, Elbows, Wrists)
-UPPER_BODY_POSE_LANDMARKS_INDICES = [0, 11, 12, 13, 14, 15, 16]
+EXPECTED_LANDMARK_COUNT = 154  # (7*4 for pose) + (21*3 for left hand) + (21*3 for right hand)
+CONFIDENCE_THRESHOLD = 0.70
 
+# --- Global State ---
+model, scaler, label_encoder, actions_map = None, None, None, {}
+executor = ThreadPoolExecutor(max_workers=os.cpu_count())
 
-# Real-time specific config
-PREDICTION_THRESHOLD = 0.60 
-PREDICTION_BUFFER_SIZE = 10 
-DISPLAY_WIDTH = 1280
-DISPLAY_HEIGHT = 720
+@app.on_event("startup")
+def startup_event():
+    global model, scaler, label_encoder, actions_map
+    logger.info("Loading prediction model and scaler...")
+    try:
+        model = load_model_with_custom_objects(MODEL_PATH)
+        scaler = joblib.load(SCALER_PATH)
+        label_encoder = joblib.load(LABEL_ENCODER_PATH)
+        actions_map = {i: action for i, action in enumerate(label_encoder.classes_)}
+        logger.info("Resources loaded successfully.")
+        logger.info("Video call functionality enabled.")
+    except Exception as e:
+        logger.error(f"Error loading model: {e}")
 
-# --- Custom Attention Layer Definition (Must match training script) ---
-@register_keras_serializable(package='CustomLayers')
-class AttentionWeightedAverage(keras.layers.Layer):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+def predict_from_landmarks(landmarks: List[float], sequence_data: deque) -> dict:
+    """Receives landmarks, preprocesses, and predicts, providing continuous feedback."""
+    sequence_data.append(landmarks)
 
-    def call(self, inputs):
-        if not isinstance(inputs, list) or len(inputs) != 2:
-            raise ValueError('A list of two tensors is expected. '
-                             f'Got: {inputs}')
-        gru_output, attention_probs = inputs
-        weighted_sequence = gru_output * attention_probs
-        context_vector = tf.reduce_sum(weighted_sequence, axis=1)
-        return context_vector
-
-    def get_config(self):
-        base_config = super().get_config()
-        return base_config
-
-# --- Helper Functions ---
-
-def load_model_with_custom_objects(model_path):
-    """Load the SavedModel/`.keras` file with the available Keras implementation.
-
-    The model was trained & exported with stand-alone Keras 3. If that package
-    is available we prefer to use it. Otherwise we fall back to `tf.keras`,
-    provided that the necessary modules from the saved configuration can be
-    imported. This approach prevents the deserialization error seen on Render
-    ("Could not deserialize class 'Functional' … keras.src.models.functional").
-    """
-
-    custom_objects = {
-        'AttentionWeightedAverage': AttentionWeightedAverage
-    }
+    if len(sequence_data) < SEQUENCE_LENGTH:
+        return {
+            "status": "buffering",
+            "progress": len(sequence_data) / SEQUENCE_LENGTH
+        }
 
     try:
-        print(f"Attempting to load model from: {model_path} (backend: {'keras' if USING_KERAS3 else 'tf.keras'})")
+        X_seq_raw = np.array(list(sequence_data))
+        X_reshaped = X_seq_raw.reshape(-1, X_seq_raw.shape[-1])
+        X_scaled = scaler.transform(X_reshaped)
+        X_scaled_reshaped = X_scaled.reshape(X_seq_raw.shape)
+        X_enhanced = add_temporal_features_realtime(X_scaled_reshaped)
+        X_input = np.expand_dims(X_enhanced, axis=0)
+        
+        prediction_probs = model.predict_on_batch(X_input)[0]
+        predicted_index = np.argmax(prediction_probs)
+        confidence = prediction_probs[predicted_index]
 
-        if USING_KERAS3:
-            model = keras.models.load_model(
-                model_path,
-                custom_objects=custom_objects,
-                compile=False,
-            )
+        if confidence > CONFIDENCE_THRESHOLD:
+            return {
+                "status": "prediction",
+                "prediction": actions_map.get(predicted_index, "Unknown"),
+                "confidence": float(confidence * 100)
+            }
         else:
-            model = keras.models.load_model(
-                model_path,
-                custom_objects=custom_objects,
-                compile=False,
-            )
-
-        print("Model loaded successfully.")
-
-        # Re-compile only if we are using tf.keras (stand-alone Keras 3 runners
-        # typically compile the model just-in-time for inference, but this is a
-        # cheap no-op anyway).
-        optimizer = keras.optimizers.Adam(learning_rate=0.0005)
-        model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
-        print("Model recompiled.")
-        return model
-
+            return {"status": "low_confidence"}
+            
     except Exception as e:
-        print(f"Error loading model: {e}")
-        traceback.print_exc()
-        return None
+        logger.error(f"Error during prediction pipeline: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
 
-def extract_focused_keypoints_realtime(results):
-    """
-    Extracts focused keypoints (Upper Body Pose:7*4, LH:21*3, RH:21*3) = 154 features
-    This MUST match the data your model was trained on.
-    """
-    pose_keypoints_list = []
-    if results.pose_landmarks:
-        for idx in UPPER_BODY_POSE_LANDMARKS_INDICES:
-            if idx < len(results.pose_landmarks.landmark):
-                landmark = results.pose_landmarks.landmark[idx]
-                pose_keypoints_list.extend([landmark.x, landmark.y, landmark.z, landmark.visibility])
-            else:
-                pose_keypoints_list.extend([0,0,0,0]) 
+# --- WebSocket Endpoints ---
+
+@app.websocket("/ws/predict")
+async def websocket_predict(websocket: WebSocket):
+    """WebSocket endpoint for single-user real-time predictions"""
+    await websocket.accept()
+    logger.info("WebSocket connection established.")
     
-    # Ensure consistent length for pose
-    if len(pose_keypoints_list) < NUM_SELECTED_POSE_LANDMARKS * 4:
-        pose_keypoints_list.extend([0] * (NUM_SELECTED_POSE_LANDMARKS * 4 - len(pose_keypoints_list)))
+    sequence_data = deque(maxlen=SEQUENCE_LENGTH)
+    loop = asyncio.get_running_loop()
+
+    try:
+        while True:
+            landmarks_data = await websocket.receive_json()
+            if not isinstance(landmarks_data, list) or len(landmarks_data) != EXPECTED_LANDMARK_COUNT:
+                logger.warning(f"Received invalid data. Expected list of {EXPECTED_LANDMARK_COUNT}, got {len(landmarks_data) if isinstance(landmarks_data, list) else 'non-list'}")
+                continue
+
+            prediction_result = await loop.run_in_executor(
+                executor, predict_from_landmarks, landmarks_data, sequence_data
+            )
+            
+            await websocket.send_json(prediction_result)
+    except WebSocketDisconnect:
+        logger.info("WebSocket connection closed.")
+    except Exception as e:
+        logger.error(f"An error occurred in the WebSocket handler: {e}", exc_info=True)
+
+@app.websocket("/ws/video-call/{room_id}")
+async def websocket_video_call(websocket: WebSocket, room_id: str):
+    """WebSocket endpoint for video call functionality"""
+    user_id = str(uuid.uuid4())
+    logger.info(f"Video call WebSocket connection attempt for room {room_id}, user {user_id}")
     
-    pose = np.array(pose_keypoints_list).flatten()
-    if pose.size == 0: # Fallback
-        pose = np.zeros(NUM_SELECTED_POSE_LANDMARKS * 4)
-
-
-    lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten() if results.left_hand_landmarks else np.zeros(21*3)
-    rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() if results.right_hand_landmarks else np.zeros(21*3)
-    
-    return np.concatenate([pose, lh, rh]) # Expected size = (7*4) + (21*3) + (21*3) = 28 + 63 + 63 = 154
-
-def add_temporal_features_realtime(X_scaled):
-    """Adds temporal features (Must match training implementation)."""
-    # X_scaled has shape (SEQUENCE_LENGTH, num_raw_features=154)
-    if X_scaled.shape[0] < 2: 
-        X_diff1 = np.zeros_like(X_scaled)
-        X_diff2 = np.zeros_like(X_scaled)
-    else:
-        X_diff1 = np.diff(X_scaled, axis=0, prepend=X_scaled[:1, :])
-        X_diff2 = np.diff(X_diff1, axis=0, prepend=X_diff1[:1, :])
-
-    velocity_mag = np.linalg.norm(X_diff1, axis=-1, keepdims=True)
-    acceleration_mag = np.linalg.norm(X_diff2, axis=-1, keepdims=True)
-    
-    # Output shape will be (SEQUENCE_LENGTH, 154*3 + 2 = 464)
-    return np.concatenate([X_scaled, X_diff1, X_diff2, velocity_mag, acceleration_mag], axis=-1)
-
-def draw_focused_landmarks_and_prediction(image, results, prediction_text, confidence_value):
-    """Draws focused landmarks (upper body pose, hands) and the prediction."""
-    mp_drawing = mp.solutions.drawing_utils
-    mp_holistic = mp.solutions.holistic
-    mp_drawing_styles = mp.solutions.drawing_styles
-    mp_hands = mp.solutions.hands
-
-    # Draw selected Pose connections (can draw all for visual, but only selected are used)
-    # To draw only selected upper body pose, you'd need a custom connection list or draw landmarks individually.
-    # For simplicity in drawing, we can draw all detected pose landmarks.
-    mp_drawing.draw_landmarks(
-        image, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS,
-        landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
-    
-    # NO FACE LANDMARKS DRAWN
-    
-    # Left Hand
-    mp_drawing.draw_landmarks(
-        image, results.left_hand_landmarks, mp_hands.HAND_CONNECTIONS,
-        landmark_drawing_spec=mp_drawing_styles.get_default_hand_landmarks_style(),
-        connection_drawing_spec=mp_drawing_styles.get_default_hand_connections_style())
-    # Right Hand
-    mp_drawing.draw_landmarks(
-        image, results.right_hand_landmarks, mp_hands.HAND_CONNECTIONS,
-        landmark_drawing_spec=mp_drawing_styles.get_default_hand_landmarks_style(),
-        connection_drawing_spec=mp_drawing_styles.get_default_hand_connections_style())
-
-    # Prediction Text
-    text_to_display = f"Prediction: {prediction_text.upper()} ({confidence_value:.2f})"
-    cv2.rectangle(image, (0,0), (image.shape[1], 40), (245, 117, 16), -1) 
-    cv2.putText(image, text_to_display, (10, 30),
-               cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-
-# --- Main Inference Function ---
-def run_inference():
-    print(f"Loading resources for ENHANCED FOCUSED model from: {MODEL_DIR}")
-    model = load_model_with_custom_objects(MODEL_PATH)
-    scaler = joblib.load(SCALER_PATH)
-    label_encoder = joblib.load(LABEL_ENCODER_PATH)
-
-    if not all([model, scaler, label_encoder]):
-        print("Failed to load one or more resources. Exiting.")
-        return
-
-    print("Resources loaded successfully.")
-    actions_map = {i: action for i, action in enumerate(label_encoder.classes_)}
-    print(f"Actions: {actions_map}")
-
-    mp_holistic = mp.solutions.holistic
-    # Use lower complexity for Face Mesh if only using hands and pose for landmarks,
-    # but Holistic includes it by default. We just won't extract its landmarks.
-    holistic = mp_holistic.Holistic(
-        min_detection_confidence=0.5, 
-        min_tracking_confidence=0.5,
-        # model_complexity=1 # Can be 0, 1, or 2. Default is 1.
-        ) 
-    
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Error: Could not open camera.")
-        holistic.close()
-        return
-    
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, DISPLAY_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DISPLAY_HEIGHT)
-
-    window_name = 'Sign Language Inference - Enhanced Focused'
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL) 
-    cv2.resizeWindow(window_name, DISPLAY_WIDTH, DISPLAY_HEIGHT)
-
-    sequence_data_raw = deque(maxlen=SEQUENCE_LENGTH) 
-    prediction_buffer = deque(maxlen=PREDICTION_BUFFER_SIZE)
-    current_prediction_text = "..."
-    current_confidence = 0.0
-
-    print("Starting inference loop...")
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret: break
+    try:
+        await websocket.accept()
+        logger.info(f"WebSocket accepted for user {user_id}")
         
-        frame = cv2.flip(frame, 1)
-        
-        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) 
-        image_rgb.flags.writeable = False
-        results = holistic.process(image_rgb)
-        image_rgb.flags.writeable = True
-        
-        # *** Use extract_focused_keypoints_realtime to get 154 features ***
-        keypoints = extract_focused_keypoints_realtime(results) 
-        sequence_data_raw.append(keypoints)
-
-        if len(sequence_data_raw) == SEQUENCE_LENGTH:
-            try:
-                X_seq_raw = np.array(sequence_data_raw) # Shape: (SEQUENCE_LENGTH, 154)
-
-                original_shape = X_seq_raw.shape
-                X_reshaped = X_seq_raw.reshape(-1, X_seq_raw.shape[-1]) # Shape: (SEQ_LEN * 1, 154)
-                X_scaled = scaler.transform(X_reshaped) # Scaler expects (n_samples, n_features)
-                X_scaled = X_scaled.reshape(original_shape) # Shape: (SEQUENCE_LENGTH, 154)
-
-                X_enhanced = add_temporal_features_realtime(X_scaled) # Shape: (SEQUENCE_LENGTH, 464)
-
-                X_input = np.expand_dims(X_enhanced, axis=0) # Shape: (1, SEQUENCE_LENGTH, 464)
-                prediction_probabilities = model.predict(X_input)[0]
-
-                predicted_index = np.argmax(prediction_probabilities)
-                confidence = prediction_probabilities[predicted_index]
-
-                if confidence > PREDICTION_THRESHOLD:
-                    prediction_buffer.append(predicted_index)
-                    current_confidence = confidence 
+        # Wait for join message with timeout
+        try:
+            data = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
+            message = json.loads(data)
+            logger.info(f"Received initial message from {user_id}: {message}")
+            
+            if message.get("type") == "join":
+                user_name = message.get("userName", f"User_{user_id[:8]}")
+                logger.info(f"User {user_name} joining room {room_id}")
+                try:
+                    await call_manager.join_room(room_id, user_id, user_name, websocket)
+                except Exception as e:
+                    logger.error(f"Exception in join_room for user {user_id}: {e}", exc_info=True)
+                    await websocket.close(code=1011, reason="Internal server error during join_room")
+                    return
                 
-                if len(prediction_buffer) > 0:
-                    most_common_pred_index = max(set(prediction_buffer), key=prediction_buffer.count)
-                    current_prediction_text = actions_map.get(most_common_pred_index, "...")
-                    # Update displayed confidence if current frame's high-confidence prediction matches the buffered one
-                    if most_common_pred_index == predicted_index and confidence > PREDICTION_THRESHOLD:
-                         current_confidence = confidence
-                    # If buffered prediction is different, we might show its last known high confidence,
-                    # or simply the confidence of the current frame if it's also high.
-                    # For now, if it doesn't match, the current_confidence (which might be from a previous frame) is shown.
-                else:
-                    current_prediction_text = "..."
-                    current_confidence = 0.0
-
-            except Exception as e:
-                print(f"Error during prediction: {e}")
-                traceback.print_exc()
-                current_prediction_text = "Error"
-                current_confidence = 0.0
+                # Handle subsequent messages
+                while True:
+                    try:
+                        data = await websocket.receive_text()
+                        message = json.loads(data)
+                        logger.debug(f"Received message from {user_id}: {message.get('type', 'unknown')}")
+                        
+                        message_type = message.get("type")
+                        
+                        if message_type in ["offer", "answer", "ice-candidate"]:
+                            try:
+                                await call_manager.handle_webrtc_message(user_id, message)
+                            except Exception as e:
+                                logger.error(f"Exception in handle_webrtc_message for user {user_id}: {e}", exc_info=True)
+                        elif message_type == "prediction-request":
+                            landmarks = message.get("landmarks", [])
+                            # The number of landmarks can vary based on MediaPipe config/visibility.
+                            # We'll let the processing function handle validation if needed.
+                            if landmarks:
+                                try:
+                                    await call_manager.handle_prediction_request(
+                                        user_id, landmarks, model, scaler, actions_map, 
+                                        SEQUENCE_LENGTH, CONFIDENCE_THRESHOLD
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Exception in handle_prediction_request for user {user_id}: {e}", exc_info=True)
+                            else:
+                                logger.warning(f"Empty landmarks received from {user_id}")
+                        elif message_type == "chat-message":
+                            content = message.get("content", "")
+                            if content.strip():
+                                try:
+                                    await call_manager.handle_chat_message(user_id, content)
+                                except Exception as e:
+                                    logger.error(f"Exception in handle_chat_message for user {user_id}: {e}", exc_info=True)
+                        else:
+                            logger.warning(f"Unknown message type from {user_id}: {message_type}")
+                            
+                    except json.JSONDecodeError as e:
+                        logger.error(f"JSON decode error from {user_id}: {e}")
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "message": "Invalid JSON format"
+                        }))
+                    except Exception as e:
+                        logger.error(f"Error processing message from {user_id}: {e}", exc_info=True)
+                        break
+            else:
+                logger.error(f"Invalid initial message from {user_id}: expected 'join', got {message.get('type')}")
+                await websocket.close(code=1003, reason="Invalid initial message")
+                
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout waiting for join message from {user_id}")
+            await websocket.close(code=1002, reason="Join timeout")
+        except Exception as e:
+            logger.error(f"Exception while waiting for join message from {user_id}: {e}", exc_info=True)
+            await websocket.close(code=1011, reason="Internal server error during join handshake")
+            return
         
-        display_image = frame.copy() 
-        draw_focused_landmarks_and_prediction(display_image, results, current_prediction_text, current_confidence)
+    except WebSocketDisconnect:
+        logger.info(f"Video call WebSocket disconnected for user {user_id}")
+    except Exception as e:
+        logger.error(f"Video call WebSocket error for user {user_id}: {e}", exc_info=True)
+    finally:
+        # Ensure cleanup happens
+        try:
+            await call_manager.leave_room(user_id)
+        except Exception as e:
+            logger.error(f"Error during cleanup for user {user_id}: {e}", exc_info=True)
+
+@app.websocket("/ws/test")
+async def websocket_test(websocket: WebSocket):
+    """Simple WebSocket test endpoint"""
+    await websocket.accept()
+    logger.info("Test WebSocket connection established")
+    
+    try:
+        await websocket.send_text(json.dumps({
+            "type": "connection-test",
+            "message": "WebSocket connection successful",
+            "timestamp": asyncio.get_event_loop().time()
+        }))
         
-        cv2.imshow(window_name, display_image)
+        while True:
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            logger.info(f"Test WebSocket received: {message}")
+            
+            await websocket.send_text(json.dumps({
+                "type": "echo",
+                "original": message,
+                "timestamp": asyncio.get_event_loop().time()
+            }))
+            
+    except WebSocketDisconnect:
+        logger.info("Test WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"Test WebSocket error: {e}")
 
-        if cv2.waitKey(5) & 0xFF == ord('q'):
-            break
+# --- REST API Endpoints ---
 
-    cap.release()
-    cv2.destroyAllWindows()
-    holistic.close()
-    print("Inference finished.")
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "ok", 
+        "video_calls_enabled": True,
+        "active_rooms": len(call_manager.rooms)
+    }
 
+@app.get("/api/video-call/rooms")
+async def get_active_rooms():
+    """Get list of active video call rooms"""
+    rooms = []
+    for room_id, room_data in call_manager.rooms.items():
+        rooms.append({
+            "roomId": room_id,
+            "participantCount": len(room_data["participants"]),
+            "createdAt": room_data["created_at"]
+        })
+    return {"rooms": rooms}
+
+@app.get("/api/video-call/rooms/{room_id}")
+async def check_room_exists(room_id: str):
+    """Check if a video call room exists."""
+    if room_id in call_manager.rooms:
+        return {"exists": True, "participantCount": len(call_manager.rooms[room_id]["participants"])}
+    else:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+@app.post("/api/video-call/create-room")
+async def create_room():
+    """Create a new video call room"""
+    room_id = str(uuid.uuid4())[:8]
+    return {"roomId": room_id}
+
+@app.post("/api/video-predict")
+async def video_predict(file: UploadFile = File(...)):
+    """Upload and analyze video for sign language predictions"""
+    input_path = f"uploads/{file.filename}"
+    output_path = f"outputs/annotated_{file.filename}"
+    
+    # Create directories if they don't exist
+    os.makedirs("uploads", exist_ok=True)
+    os.makedirs("outputs", exist_ok=True)
+    
+    # Save uploaded file
+    with open(input_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    try:
+        # Process video
+        results = predict_on_video(input_path, output_path)
+        return JSONResponse({
+            "predictions": results,
+            "annotated_video_url": f"/api/download/{os.path.basename(output_path)}"
+        })
+    except Exception as e:
+        logger.error(f"Error processing video: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing video: {str(e)}")
+
+@app.get("/api/download/{filename}")
+async def download_annotated_video(filename: str):
+    """Download annotated video file"""
+    file_path = f"outputs/{filename}"
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path, media_type="video/mp4", filename=filename)
+
+# --- Main ---
 if __name__ == "__main__":
-    run_inference()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
